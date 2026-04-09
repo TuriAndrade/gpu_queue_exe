@@ -144,10 +144,8 @@ gqe__query_gpu_state() {
     --format=csv,noheader,nounits)
 
   GQE_GPU_SNAPSHOT="$out"
-  unset GQE_GPU_TOTAL GQE_GPU_USED GQE_GPU_FREE
+  unset GQE_GPU_TOTAL
   declare -gA GQE_GPU_TOTAL=()
-  declare -gA GQE_GPU_USED=()
-  declare -gA GQE_GPU_FREE=()
 
   while IFS=',' read -r idx total used; do
     idx="${idx//[[:space:]]/}"
@@ -156,10 +154,8 @@ gqe__query_gpu_state() {
     [[ -n "$idx" ]] || continue
 
     GQE_GPU_TOTAL["$idx"]="$total"
-    GQE_GPU_USED["$idx"]="$used"
-    GQE_GPU_FREE["$idx"]=$((total - used))
   done <<< "$out"
-}
+  }
 
 gqe__append_queue() {
   local job_id="$1"
@@ -388,8 +384,14 @@ gqe__run() {
 
       unset GQE_RESERVED_FREE
       declare -gA GQE_RESERVED_FREE=()
+
       for dev in "${GQE_DEVICE_IDS[@]}"; do
-        GQE_RESERVED_FREE["$dev"]="${GQE_GPU_FREE[$dev]}"
+        GQE_RESERVED_FREE["$dev"]=$(( GQE_GPU_TOTAL[$dev] - GQE_OFFSET_MB ))
+      done
+
+      for pid in "${GQE_ACTIVE_PIDS[@]}"; do
+        dev="${GQE_PID_TO_DEV[$pid]}"
+        GQE_RESERVED_FREE["$dev"]=$(( GQE_RESERVED_FREE[$dev] - GQE_PID_TO_MIN[$pid] ))
       done
 
       launched_any=0
