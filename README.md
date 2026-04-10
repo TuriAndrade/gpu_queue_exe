@@ -21,7 +21,7 @@ A lightweight Bash utility to execute a list of GPU jobs while respecting availa
 ## Usage
 
 ```bash
-gpu_queue_exe --devices 0,1 --min-memory 12000 --runs-file runs.txt [options]
+gpu_queue_exe --devices 0,1 --min-memory 12000 --runs-file file1.txt --runs-file file2.txt [options]
 ```
 
 ## Required arguments
