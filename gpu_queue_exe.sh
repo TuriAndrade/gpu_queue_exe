@@ -10,7 +10,7 @@ gpu_queue_exe() {
 }
 
 gqe__init_defaults() {
-  GQE_RUNS_FILE=""
+  declare -ga GQE_RUNS_FILES=()
   GQE_DEVICES_ARG=""
   GQE_GLOBAL_MIN_MEMORY=""
   GQE_OFFSET_MB=1024
@@ -23,12 +23,12 @@ gqe__init_defaults() {
 gqe__usage() {
   cat <<'USAGE'
 Usage:
-  gpu_queue_exe --devices 0,1 --min-memory 12000 --runs-file file.txt [options]
+  gpu_queue_exe --devices 0,1 --min-memory 12000 --runs-file file1.txt --runs-file file2.txt [options]
 
 Required:
   --devices              Comma-separated physical GPU ids, e.g. 0,1 or cuda:0,cuda:1
   --min-memory           Initial minimum free memory (MiB) required to launch each job
-  --runs-file            File with one command per line
+  --runs-file            File with one command per line; may be passed multiple times
 
 Optional:
   --offset               Safety offset in MiB when capping retried jobs and updating min memory
@@ -74,7 +74,7 @@ gqe__parse_args() {
         shift 2
         ;;
       --runs-file)
-        GQE_RUNS_FILE="${2:-}"
+        GQE_RUNS_FILES+=("${2:-}")
         shift 2
         ;;
       --offset)
@@ -111,7 +111,7 @@ gqe__parse_args() {
 gqe__validate_args() {
   [[ -n "$GQE_DEVICES_ARG" ]] || gqe__die "--devices is required" || return 1
   [[ -n "$GQE_GLOBAL_MIN_MEMORY" ]] || gqe__die "--min-memory is required" || return 1
-  [[ -n "$GQE_RUNS_FILE" ]] || gqe__die "--runs-file is required" || return 1
+  (( ${#GQE_RUNS_FILES[@]} > 0 )) || gqe__die "At least one --runs-file is required" || return 1
 
   [[ "$GQE_GLOBAL_MIN_MEMORY" =~ ^[0-9]+$ ]] || gqe__die "--min-memory must be an integer (MiB)" || return 1
   [[ "$GQE_OFFSET_MB" =~ ^[0-9]+$ ]] || gqe__die "--offset must be an integer (MiB)" || return 1
@@ -119,7 +119,10 @@ gqe__validate_args() {
   awk -v x="$GQE_RETRY_FACTOR" 'BEGIN { exit !(x > 1) }' || gqe__die "--retry-factor must be > 1" || return 1
   [[ "$GQE_POLL_SECONDS" =~ ^([0-9]+|[0-9]*\.[0-9]+)$ ]] || gqe__die "--poll-seconds must be numeric" || return 1
 
-  [[ -f "$GQE_RUNS_FILE" ]] || gqe__die "Runs file not found: $GQE_RUNS_FILE" || return 1
+  local runs_file
+  for runs_file in "${GQE_RUNS_FILES[@]}"; do
+    [[ -f "$runs_file" ]] || gqe__die "Runs file not found: $runs_file" || return 1
+  done
   command -v nvidia-smi >/dev/null 2>&1 || gqe__die "nvidia-smi not found" || return 1
 
   GQE_DEVICE_IDS=()
@@ -137,6 +140,8 @@ gqe__validate_args() {
 
 gqe__query_gpu_state() {
   local gpu_csv out idx total used
+  local app_out pid curr_used old_min
+
   gpu_csv=$(IFS=,; echo "${GQE_DEVICE_IDS[*]}")
 
   out=$(nvidia-smi -i "$gpu_csv" \
@@ -155,7 +160,31 @@ gqe__query_gpu_state() {
 
     GQE_GPU_TOTAL["$idx"]="$total"
   done <<< "$out"
-  }
+
+  unset GQE_PID_USED
+  declare -gA GQE_PID_USED=()
+
+  app_out=$(nvidia-smi \
+    --query-compute-apps=pid,used_memory \
+    --format=csv,noheader,nounits 2>/dev/null || true)
+
+  while IFS=',' read -r pid curr_used; do
+    pid="${pid//[[:space:]]/}"
+    curr_used="${curr_used//[[:space:]]/}"
+    [[ -n "$pid" && -n "$curr_used" ]] || continue
+    GQE_PID_USED["$pid"]="$curr_used"
+  done <<< "$app_out"
+
+  for pid in "${GQE_ACTIVE_PIDS[@]}"; do
+    [[ -n "$pid" ]] || continue
+    curr_used="${GQE_PID_USED[$pid]:-}"
+    [[ -n "$curr_used" ]] || continue
+    old_min="${GQE_PID_TO_MIN[$pid]}"
+    if (( curr_used > old_min )); then
+      GQE_PID_TO_MIN["$pid"]="$curr_used"
+    fi
+  done
+}
 
 gqe__append_queue() {
   local job_id="$1"
@@ -176,15 +205,17 @@ gqe__load_queue() {
   declare -ga GQE_QUEUE_MINS=()
   declare -ga GQE_QUEUE_ATTEMPTS=()
 
-  local cmd job_counter=0
-  while IFS= read -r cmd || [[ -n "$cmd" ]]; do
-    [[ -z "${cmd//[[:space:]]/}" ]] && continue
-    [[ "$cmd" =~ ^[[:space:]]*# ]] && continue
-    job_counter=$((job_counter + 1))
-    gqe__append_queue "$job_counter" "$cmd" "$GQE_GLOBAL_MIN_MEMORY" 0
-  done < "$GQE_RUNS_FILE"
+  local cmd job_counter=0 runs_file
+  for runs_file in "${GQE_RUNS_FILES[@]}"; do
+    while IFS= read -r cmd || [[ -n "$cmd" ]]; do
+      [[ -z "${cmd//[[:space:]]/}" ]] && continue
+      [[ "$cmd" =~ ^[[:space:]]*# ]] && continue
+      job_counter=$((job_counter + 1))
+      gqe__append_queue "$job_counter" "$cmd" "$GQE_GLOBAL_MIN_MEMORY" 0
+    done < "$runs_file"
+  done
 
-  (( ${#GQE_QUEUE_CMDS[@]} > 0 )) || gqe__die "No runnable commands found in $GQE_RUNS_FILE" || return 1
+  (( ${#GQE_QUEUE_CMDS[@]} > 0 )) || gqe__die "No runnable commands found in provided runs files" || return 1
 }
 
 gqe__compute_max_launch_mem() {
@@ -226,7 +257,7 @@ gqe__launch_job() {
   full_cmd=$(gqe__build_launch_cmd "$cmd" "$dev")
 
   echo "[gpu_queue_exe] Launching job=$job_id attempt=$attempt gpu=$dev min_mem=${min_mem}MiB"
-  CUDA_VISIBLE_DEVICES="$dev" bash -lc "$full_cmd" >"$out_log" 2>"$err_log" &
+  CUDA_VISIBLE_DEVICES="$dev" bash -c "exec $full_cmd" >"$out_log" 2>"$err_log" &
   local pid=$!
 
   GQE_ACTIVE_PIDS+=("$pid")
@@ -344,10 +375,11 @@ gqe__run() {
   mkdir -p "$GQE_LOGS_DIR" || return 1
 
   gqe__load_queue || return 1
-  gqe__compute_max_launch_mem || return 1
 
   unset GQE_ACTIVE_PIDS
   declare -ga GQE_ACTIVE_PIDS=()
+
+  gqe__compute_max_launch_mem || return 1
 
   unset GQE_PID_TO_DEV GQE_PID_TO_CMD GQE_PID_TO_MIN GQE_PID_TO_JOBID GQE_PID_TO_ATTEMPT GQE_PID_TO_OUT GQE_PID_TO_ERR
   declare -gA GQE_PID_TO_DEV=()
