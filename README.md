@@ -50,6 +50,15 @@ gpu_queue_exe --devices 0,1 --min-memory 12000 --runs-file file1.txt --runs-file
   Time in seconds between GPU state checks  
   Default: `20`
 
+- `--stabilization-delay`  
+  Time in seconds a running job must keep the same observed GPU memory before its GPU is considered stable for another launch  
+  Default: `20`
+
+- `--max-jobs`  
+  Maximum number of jobs allowed simultaneously on the machine  
+  Use `0` for no machine-wide cap  
+  Default: `0`
+
 - `--logs-dir`  
   Directory where stdout and stderr logs are saved  
   Default: `./logs`
