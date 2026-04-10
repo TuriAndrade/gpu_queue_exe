@@ -16,6 +16,8 @@ gqe__init_defaults() {
   GQE_OFFSET_MB=1024
   GQE_RETRY_FACTOR=2.0
   GQE_POLL_SECONDS=20
+  GQE_STABILIZATION_DELAY=20
+  GQE_MAX_JOBS=0
   GQE_LOGS_DIR="./logs"
   GQE_WORKDIR=""
 }
@@ -38,6 +40,12 @@ Optional:
                          default: 2.0
   --poll-seconds         Poll interval for GPU memory changes
                          default: 20
+  --stabilization-delay  Cooldown in seconds after launching on a GPU before
+                         another job may be launched on that same GPU
+                         default: 20
+  --max-jobs            Maximum number of jobs allowed simultaneously in the machine
+                        0 means unlimited
+                        default: 0
   --logs-dir             Directory for stdout/stderr logs
                          default: ./logs
   --workdir              Working directory before launching jobs
@@ -89,6 +97,14 @@ gqe__parse_args() {
         GQE_POLL_SECONDS="${2:-}"
         shift 2
         ;;
+      --stabilization-delay)
+        GQE_STABILIZATION_DELAY="${2:-}"
+        shift 2
+        ;;
+      --max-jobs)
+        GQE_MAX_JOBS="${2:-}"
+        shift 2
+        ;;
       --logs-dir)
         GQE_LOGS_DIR="${2:-}"
         shift 2
@@ -118,6 +134,8 @@ gqe__validate_args() {
   [[ "$GQE_RETRY_FACTOR" =~ ^([0-9]+|[0-9]*\.[0-9]+)$ ]] || gqe__die "--retry-factor must be numeric" || return 1
   awk -v x="$GQE_RETRY_FACTOR" 'BEGIN { exit !(x > 1) }' || gqe__die "--retry-factor must be > 1" || return 1
   [[ "$GQE_POLL_SECONDS" =~ ^([0-9]+|[0-9]*\.[0-9]+)$ ]] || gqe__die "--poll-seconds must be numeric" || return 1
+  [[ "$GQE_STABILIZATION_DELAY" =~ ^[0-9]+$ ]] || gqe__die "--stabilization-delay must be an integer (seconds)" || return 1
+  [[ "$GQE_MAX_JOBS" =~ ^[0-9]+$ ]] || gqe__die "--max-jobs must be a non-negative integer" || return 1
 
   local runs_file
   for runs_file in "${GQE_RUNS_FILES[@]}"; do
@@ -175,10 +193,19 @@ gqe__query_gpu_state() {
     GQE_PID_USED["$pid"]="$curr_used"
   done <<< "$app_out"
 
+  local now_ts
+  now_ts=$(date +%s)
+
   for pid in "${GQE_ACTIVE_PIDS[@]}"; do
     [[ -n "$pid" ]] || continue
     curr_used="${GQE_PID_USED[$pid]:-}"
     [[ -n "$curr_used" ]] || continue
+
+    if [[ "${GQE_PID_LAST_USED[$pid]:-}" != "$curr_used" ]]; then
+      GQE_PID_LAST_USED["$pid"]="$curr_used"
+      GQE_PID_STABLE_UNTIL["$pid"]=$(( now_ts + GQE_STABILIZATION_DELAY ))
+    fi
+
     old_min="${GQE_PID_TO_MIN[$pid]}"
     if (( curr_used > old_min )); then
       GQE_PID_TO_MIN["$pid"]="$curr_used"
@@ -268,6 +295,8 @@ gqe__launch_job() {
   GQE_PID_TO_ATTEMPT["$pid"]="$attempt"
   GQE_PID_TO_OUT["$pid"]="$out_log"
   GQE_PID_TO_ERR["$pid"]="$err_log"
+  GQE_PID_LAST_USED["$pid"]=""
+  GQE_PID_STABLE_UNTIL["$pid"]=$(( GQE_NOW_TS + GQE_STABILIZATION_DELAY ))
 }
 
 gqe__harvest_finished_jobs() {
@@ -324,6 +353,8 @@ gqe__harvest_finished_jobs() {
     unset GQE_PID_TO_ATTEMPT["$pid"]
     unset GQE_PID_TO_OUT["$pid"]
     unset GQE_PID_TO_ERR["$pid"]
+    unset GQE_PID_LAST_USED["$pid"]
+    unset GQE_PID_STABLE_UNTIL["$pid"]
   done
 
   GQE_ACTIVE_PIDS=("${still_running[@]}")
@@ -333,10 +364,24 @@ gqe__pick_best_device_for_min() {
   local min_mem="$1"
   local best_dev=""
   local dev free_mem total_a total_b used_a used_b
+  local pid pid_dev stable_until blocked
 
   for dev in "${GQE_DEVICE_IDS[@]}"; do
     free_mem="${GQE_RESERVED_FREE[$dev]}"
     (( free_mem >= min_mem )) || continue
+
+    blocked=0
+    for pid in "${GQE_ACTIVE_PIDS[@]}"; do
+      pid_dev="${GQE_PID_TO_DEV[$pid]:-}"
+      [[ "$pid_dev" == "$dev" ]] || continue
+
+      stable_until="${GQE_PID_STABLE_UNTIL[$pid]:-0}"
+      if (( GQE_NOW_TS < stable_until )); then
+        blocked=1
+        break
+      fi
+    done
+    (( blocked == 0 )) || continue
 
     if [[ -z "$best_dev" ]]; then
       best_dev="$dev"
@@ -381,7 +426,7 @@ gqe__run() {
 
   gqe__compute_max_launch_mem || return 1
 
-  unset GQE_PID_TO_DEV GQE_PID_TO_CMD GQE_PID_TO_MIN GQE_PID_TO_JOBID GQE_PID_TO_ATTEMPT GQE_PID_TO_OUT GQE_PID_TO_ERR
+  unset GQE_PID_TO_DEV GQE_PID_TO_CMD GQE_PID_TO_MIN GQE_PID_TO_JOBID GQE_PID_TO_ATTEMPT GQE_PID_TO_OUT GQE_PID_TO_ERR GQE_PID_LAST_USED GQE_PID_STABLE_UNTIL
   declare -gA GQE_PID_TO_DEV=()
   declare -gA GQE_PID_TO_CMD=()
   declare -gA GQE_PID_TO_MIN=()
@@ -389,6 +434,8 @@ gqe__run() {
   declare -gA GQE_PID_TO_ATTEMPT=()
   declare -gA GQE_PID_TO_OUT=()
   declare -gA GQE_PID_TO_ERR=()
+  declare -gA GQE_PID_LAST_USED=()
+  declare -gA GQE_PID_STABLE_UNTIL=()
 
   GQE_LAST_GPU_SNAPSHOT=""
   GQE_FIRST_DISPATCH=1
@@ -406,6 +453,8 @@ gqe__run() {
       dispatch_now=1
     elif (( GQE_HARVESTED_ANY )); then
       dispatch_now=1
+    elif (( ${#GQE_QUEUE_CMDS[@]} > 0 )); then
+      dispatch_now=1
     elif [[ "$GQE_GPU_SNAPSHOT" != "$GQE_LAST_GPU_SNAPSHOT" ]]; then
       dispatch_now=1
     fi
@@ -413,6 +462,7 @@ gqe__run() {
     if (( dispatch_now )); then
       GQE_FIRST_DISPATCH=0
       GQE_LAST_GPU_SNAPSHOT="$GQE_GPU_SNAPSHOT"
+      GQE_NOW_TS=$(date +%s)
 
       unset GQE_RESERVED_FREE
       declare -gA GQE_RESERVED_FREE=()
@@ -429,6 +479,10 @@ gqe__run() {
       launched_any=0
 
       while (( ${#GQE_QUEUE_CMDS[@]} > 0 )); do
+        if (( GQE_MAX_JOBS > 0 && ${#GQE_ACTIVE_PIDS[@]} >= GQE_MAX_JOBS )); then
+          break
+        fi
+
         chosen_idx=-1
         chosen_dev=""
 
